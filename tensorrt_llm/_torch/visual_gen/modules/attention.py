@@ -7,7 +7,13 @@ import torch.nn as nn
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
-from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ...modules.linear import (
+    Linear,
+    NVFP4SVDLinearMethod,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
 from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
@@ -133,6 +139,11 @@ class Attention(nn.Module):
             and self.quant_config.layer_quant_mode.has_nvfp4()
             and not self.force_dynamic_quantization
         )
+        # SVDQuant analog of the dedup above: one smoothed quantize shared
+        # across to_q/to_k/to_v. Enabled after checkpoint loading by
+        # finalize_svdquant_qkv_sharing() (the SVDQuant method swap and the
+        # scale-identity check both need loaded weights).
+        self._svdquant_share_qkv_quantize = False
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
 
@@ -327,6 +338,60 @@ class Attention(nn.Module):
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
             )
+
+    def finalize_svdquant_qkv_sharing(self) -> None:
+        """Enable the shared SVDQuant input quantize across to_q/to_k/to_v.
+
+        Call after checkpoint loading (the SVDQuant method swap happens at load
+        time). Eligibility mirrors ``_maybe_share_qkv_quantize`` but for the
+        smoothed quantize: all three projections must run the fused SVDQuant
+        path with bit-identical ``pre_quant_scale`` / ``input_scale`` — the
+        ModelOpt self-attention calibration invariant (q/k/v see the same
+        input distribution). Checked here once instead of per forward.
+        """
+        self._svdquant_share_qkv_quantize = False
+        if self.qkv_mode != QKVMode.SEPARATE_QKV:
+            return
+        projections = [getattr(self, name, None) for name in ("to_q", "to_k", "to_v")]
+        if not all(
+            isinstance(getattr(proj, "quant_method", None), NVFP4SVDLinearMethod)
+            and getattr(proj, "_svdquant_use_fused", False)
+            for proj in projections
+        ):
+            return
+        to_q, to_k, to_v = projections
+        for other in (to_k, to_v):
+            if not (
+                torch.equal(to_q.pre_quant_scale, other.pre_quant_scale)
+                and torch.equal(to_q.input_scale, other.input_scale)
+            ):
+                return
+        self._svdquant_share_qkv_quantize = True
+
+    def _svdquant_shared_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """SEPARATE_QKV self-attn q/k/v with one shared smoothed quantize.
+
+        The scale identity established by :meth:`finalize_svdquant_qkv_sharing`
+        makes this exact: the smoothed FP4 activation and the BF16 activation
+        are computed once; each projection keeps its own rank-r down-projection
+        and fused residual+LoRA-up GEMM.
+        """
+        to_q = self.to_q
+        method = to_q.quant_method
+        orig_shape, x2d, xq, x_sf = method._prepare_svdquant_input(
+            to_q, hidden_states, to_q.pre_quant_scale
+        )
+        outputs = []
+        for proj in (to_q, self.to_k, self.to_v):
+            down = torch.mm(x2d, proj._svdquant_l2t_smoothed)
+            outputs.append(
+                proj.quant_method._apply_svdquant_precomputed(
+                    proj, orig_shape, xq, x_sf, down, proj.bias
+                )
+            )
+        return outputs[0], outputs[1], outputs[2]
 
     def get_qkv(
         self,
@@ -551,6 +616,32 @@ class Attention(nn.Module):
             out = self._attn_impl(q, k, v, timestep=timestep)
             return self.to_out[0](out)
 
+        # Split-fused path: SEPARATE_QKV self-attention (e.g. SVDQuant's
+        # per-projection q/k/v) keeps the fused norm+RoPE kernels by applying
+        # the per-tensor split variant on q/k in place — the same calls the
+        # async-ulysses closures use.
+        if (
+            self.fuse_qk_norm_rope
+            and freqs is not None
+            and self.qk_norm
+            and self.qkv_mode == QKVMode.SEPARATE_QKV
+            and encoder_hidden_states is None
+            and not isinstance(hidden_states, Fp4QuantizedTensor)
+        ):
+            if self._svdquant_share_qkv_quantize:
+                q, k, v = self._svdquant_shared_qkv(hidden_states)
+            else:
+                q, k, v = self.get_qkv(hidden_states)
+            freqs_cos, freqs_sin = freqs
+            self.apply_split_norm_rope(
+                q, self.norm_q.weight, self.num_attention_heads, freqs_cos, freqs_sin
+            )
+            self.apply_split_norm_rope(
+                k, self.norm_k.weight, self.num_key_value_heads, freqs_cos, freqs_sin
+            )
+            out = self._attn_impl(q, k, v, timestep=timestep)
+            return self.to_out[0](out)
+
         # Unfused path: separate QK norm → separate RoPE → attention
         q, k, v = self.get_qkv(hidden_states, encoder_hidden_states)
         q, k = self.apply_qk_norm(q, k)
@@ -630,9 +721,16 @@ class Attention(nn.Module):
         #   * else -> bf16, each Linear quantizes its own (non-NVFP4 / NVFP4-excluded layers).
         # Eligibility is structural (set in __init__); the runtime gate checks the checkpoint
         # loaded an input_scale (some attn Linears are NVFP4-excluded -- e.g. LTX-2 blocks.10.attn1).
+        # SVDQuant projections fold pre_quant_scale smoothing into their own quantize
+        # (nvfp4_quantize_smooth); a shared plain FP4 quantize would silently skip the
+        # smoothing, so they keep per-projection quantization (bf16 passthrough).
         if isinstance(hidden_states, Fp4QuantizedTensor):
             qkv_input = hidden_states
-        elif self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+        elif (
+            self._maybe_share_qkv_quantize
+            and getattr(self.to_q, "input_scale", None) is not None
+            and getattr(self.to_q, "svdquant_lora_a", None) is None
+        ):
             x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
             fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
                 x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False

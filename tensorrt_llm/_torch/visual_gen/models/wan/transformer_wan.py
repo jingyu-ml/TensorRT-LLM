@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4SVDLinearMethod, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -28,6 +28,17 @@ except ImportError:
     # Removed in transformers>=5
     def get_parameter_device(module):
         return next(module.parameters()).device
+
+
+def _is_svdquant_quantization_config(pretrained_config) -> bool:
+    """True when the checkpoint's embedded quantization_config is ModelOpt
+    SVDQuant (``NVFP4_SVD``: NVFP4 residual + rank-r BF16 LoRA correction)."""
+    quantization_config = getattr(pretrained_config, "quantization_config", None)
+    return (
+        isinstance(quantization_config, dict)
+        and quantization_config.get("quant_algo") == "NVFP4_SVD"
+    )
+
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -299,7 +310,16 @@ class WanBlock(nn.Module):
         ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
         _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
         self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
-        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
+        # SVDQuant checkpoints carry per-projection rank-r LoRA factors and
+        # per-projection NVFP4 global scales. Concatenating q/k/v would stack
+        # the LoRA factors block-diagonally (3x the rank, past the fused
+        # kernel's fixed rank-32) and force a lossy requantization onto shared
+        # scales, so keep the projections separate: each runs the fused rank-r
+        # SVDQuant GEMM with its exact checkpoint factors.
+        _svdquant = _is_svdquant_quantization_config(config)
+        _qkv_mode_self = (
+            QKVMode.SEPARATE_QKV if (self._use_async_ulysses or _svdquant) else QKVMode.FUSE_QKV
+        )
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -791,6 +811,23 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
         weights = remapped_weights
 
+        # SVDQuant: the NVFP4 residual loads on the standard NVFP4 path; swap
+        # in the method that also loads + applies the rank-r BF16 LoRA
+        # correction and pre_quant_scale smoothing. Detected from the
+        # checkpoint (the config maps NVFP4_SVD -> NVFP4 so the residual
+        # reuses the NVFP4 machinery); NVFP4-excluded modules keep their
+        # unquantized method.
+        if any(key.endswith(".svdquant_lora_a") for key in weights):
+            for _, module in self.named_modules():
+                if (
+                    isinstance(module, Linear)
+                    and module.quant_config is not None
+                    and module.quant_config.quant_algo is not None
+                ):
+                    module.quant_method = NVFP4SVDLinearMethod()
+                    module.svdquant_lora_a = None
+                    module.svdquant_lora_b = None
+
         # Handle root-level parameters (filter_weights doesn't work for empty prefix)
         for param_name, param in self._parameters.items():
             if param is not None and param_name in weights:
@@ -836,3 +873,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
         for _, module in self.named_modules():
             if isinstance(module, Linear):
                 module.post_load_weights()
+
+        # SVDQuant SEPARATE_QKV self-attention: share one smoothed input
+        # quantize across to_q/to_k/to_v when the loaded scales allow it.
+        for _, module in self.named_modules():
+            if isinstance(module, Attention):
+                module.finalize_svdquant_qkv_sharing()
