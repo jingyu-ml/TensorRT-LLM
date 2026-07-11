@@ -1947,6 +1947,45 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
             module.svdquant_lora_b = nn.Parameter(
                 w["svdquant_lora_b"].to(device), requires_grad=False)
 
+    def load_weights_fused_qkv_linear(self,
+                                      module,
+                                      weights,
+                                      allow_partial_loading: bool = False
+                                      ) -> None:
+        """Fused-QKV SVDQuant: the NVFP4 residuals concatenate on the base
+        path (which asserts input_scale/weight_scale_2 equality across the
+        shards), and the per-projection factors concatenate exactly:
+        pre_quant_scale is bit-identical across q/k/v (ModelOpt calibrates a
+        self-attention's projections on the same smoothed activation), the L2
+        factors stack along the rank dimension, and the L1 factors form a
+        block diagonal, so ``W_fused ~= R_fused + blockdiag(L1) @ vstack(L2)``
+        reproduces each projection's correction with rank ``sum(r_i)``.
+        """
+        super().load_weights_fused_qkv_linear(
+            module, weights, allow_partial_loading=allow_partial_loading)
+        shards = weights[:3]
+        num_lora = sum("svdquant_lora_a" in w for w in shards)
+        if num_lora == 0:
+            return
+        assert num_lora == len(shards), (
+            "fused-QKV SVDQuant requires LoRA factors on all of q/k/v or none")
+        device = module.weight.device
+        pqs = [w.get("pre_quant_scale") for w in shards]
+        assert all(p is not None for p in pqs) and all(
+            torch.equal(pqs[0], p) for p in pqs[1:]), (
+                "fused-QKV SVDQuant requires bit-identical pre_quant_scale "
+                "across q/k/v")
+        if getattr(module, "pre_quant_scale", None) is None:
+            module.pre_quant_scale = nn.Parameter(pqs[0].to(device),
+                                                  requires_grad=False)
+        module.svdquant_lora_a = nn.Parameter(torch.cat(
+            [w["svdquant_lora_a"] for w in shards], dim=0).to(device),
+                                              requires_grad=False)
+        module.svdquant_lora_b = nn.Parameter(
+            torch.block_diag(*[w["svdquant_lora_b"]
+                               for w in shards]).to(device),
+            requires_grad=False)
+
     def transform_weights(self, module) -> None:
         super().transform_weights(module)
         lora_a = getattr(module, "svdquant_lora_a", None)

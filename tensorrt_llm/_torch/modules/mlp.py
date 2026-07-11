@@ -134,13 +134,19 @@ class MLP(nn.Module):
         # Fuse up_proj GEMM + bias + GELU(tanh) (+ NVFP4-quant) into the GEMM
         # epilogue (mirrors GatedMLP). Static eligibility can go stale: quant_method
         # may be downgraded to unquantized after create_weights (e.g. LTX-2
-        # quant-exclusion), so re-check the NVFP4 _input_prepare at runtime (a
-        # torch.compile trace-time guard, not a per-step cost); else fall back to eager.
-        if self._use_fused_gelu and hasattr(
-                getattr(self.up_proj, "quant_method", None), "_input_prepare"):
-            if self._use_fused_gelu_fp4out and hasattr(
-                    getattr(self.down_proj, "quant_method", None),
-                    "_input_prepare"):
+        # quant-exclusion) or upgraded to SVDQuant after checkpoint inspection,
+        # so re-check the NVFP4 _input_prepare at runtime (a torch.compile
+        # trace-time guard, not a per-step cost); else fall back to eager.
+        # SVDQuant projections (loaded svdquant_lora_a) must run their own
+        # apply(): the fused epilogue would compute the plain NVFP4 GEMM
+        # without the rank-r LoRA correction or pre_quant_scale smoothing.
+        if (self._use_fused_gelu and hasattr(
+                getattr(self.up_proj, "quant_method", None), "_input_prepare")
+                and getattr(self.up_proj, "svdquant_lora_a", None) is None):
+            if (self._use_fused_gelu_fp4out
+                    and hasattr(getattr(self.down_proj, "quant_method", None),
+                                "_input_prepare") and
+                    getattr(self.down_proj, "svdquant_lora_a", None) is None):
                 m = self._token_count(x)
                 return self.down_proj(
                     self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
@@ -148,7 +154,10 @@ class MLP(nn.Module):
 
         x_up = self.up_proj(x)
 
-        if self._use_fused_relu2_quant:
+        # A pre-quantized activation would bypass a SVDQuant down_proj's
+        # smoothed quantize, so keep the activation in bf16 for it.
+        if self._use_fused_relu2_quant and getattr(
+                self.down_proj, "svdquant_lora_a", None) is None:
             x_act = self._fused_relu2_quant(x_up)
         else:
             x_act = self.activation(x_up)
