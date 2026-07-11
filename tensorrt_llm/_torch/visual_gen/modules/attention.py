@@ -343,7 +343,10 @@ class Attention(nn.Module):
         """Enable the shared SVDQuant input quantize across to_q/to_k/to_v.
 
         Call after checkpoint loading (the SVDQuant method swap happens at load
-        time). Eligibility mirrors ``_maybe_share_qkv_quantize`` but for the
+        time). Only SEPARATE_QKV attentions qualify (sync SVDQuant
+        self-attention builds FUSE_QKV, where one fused projection already
+        quantizes once; this covers the async-ulysses per-projection mode).
+        Eligibility mirrors ``_maybe_share_qkv_quantize`` but for the
         smoothed quantize: all three projections must run the fused SVDQuant
         path with bit-identical ``pre_quant_scale`` / ``input_scale`` — the
         ModelOpt self-attention calibration invariant (q/k/v see the same

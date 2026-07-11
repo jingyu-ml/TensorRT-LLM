@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Unit tests for Wan2.2 NVFP4 SVDQuant (``NVFP4_SVD``) checkpoint loading:
-- SVDQuant checkpoints build self-attention with SEPARATE_QKV (per-projection
-  rank-r LoRA factors cannot be concatenated into the fused-QKV projection);
-  plain NVFP4 keeps the fused QKV projection.
+- SVDQuant checkpoints build self-attention with the same fused QKV projection
+  as plain NVFP4: q/k/v residuals concatenate losslessly (bit-identical scales,
+  ModelOpt's self-attention calibration invariant) and the per-projection
+  rank-r LoRA factors stack block-diagonally into one rank-3r correction.
 - load_weights swaps quantized Linears to NVFP4SVDLinearMethod, loads the LoRA
-  factors, and activates the fused kernel for rank 32 (reference fallback for
-  other ranks); NVFP4-excluded modules are untouched.
+  factors, and activates the fused kernel for every rank that is a positive
+  multiple of 32; NVFP4-excluded modules are untouched.
 - The MLP GELU epilogue fusion must not bypass a SVDQuant projection.
 """
 
@@ -114,42 +115,92 @@ def _ckpt_name(module_name: str) -> str:
     )
 
 
+def _emit_svdquant_entries(
+    weights: dict,
+    ck: str,
+    qweight,
+    weight_scale,
+    weight_scale_2,
+    pre_quant_scale,
+    rank: int,
+    out_f: int,
+    in_f: int,
+) -> None:
+    torch_gen = torch.Generator().manual_seed(hash(ck) % (2**31))
+    weights[f"{ck}.weight"] = qweight.cpu()
+    weights[f"{ck}.weight_scale"] = weight_scale.cpu()
+    weights[f"{ck}.weight_scale_2"] = weight_scale_2.cpu()
+    weights[f"{ck}.input_scale"] = torch.tensor(0.005, dtype=torch.float32)
+    weights[f"{ck}.pre_quant_scale"] = pre_quant_scale
+    weights[f"{ck}.svdquant_lora_a"] = (torch.randn(rank, in_f, generator=torch_gen) * 0.01).to(
+        torch.bfloat16
+    )
+    weights[f"{ck}.svdquant_lora_b"] = (torch.randn(out_f, rank, generator=torch_gen) * 0.01).to(
+        torch.bfloat16
+    )
+    weights[f"{ck}.bias"] = torch.zeros(out_f, dtype=torch.bfloat16)
+
+
 def _build_svdquant_state_dict(model: WanTransformer3DModel, rank: int) -> dict:
     torch.manual_seed(0)
     weights = {}
     covered = set()
-    # ModelOpt's self-attn calibration yields bit-identical pre_quant_scale /
-    # input_scale across a self-attention's q/k/v (same input distribution).
-    # Mirror that for attn1 triples so the shared-quantize path is exercised;
-    # give every other projection its own scales (negative case for attn2).
-    shared_pqs = {}
     for name, module in model.named_modules():
         if not _is_svdquant_target(module):
             continue
         out_f, in_f = module.out_features, module.in_features
+        ck = _ckpt_name(name)
+        covered.update(f"{name}.{param_name}" for param_name, _ in module.named_parameters())
+        if name.endswith(".attn1.qkv_proj"):
+            # ModelOpt's self-attn calibration yields bit-identical
+            # pre_quant_scale / input_scale / weight_scale_2 across q/k/v
+            # (same input distribution, shared weight amax for the fused
+            # group). Mirror that: quantize the concatenated q/k/v weight
+            # once and split the rows into per-projection checkpoint shards.
+            shard_out = out_f // 3
+            w_ref = (torch.randn(out_f, in_f, device="cuda") * 0.02).to(torch.bfloat16)
+            qweight, weight_scale, weight_scale_2 = quantize_nvfp4(w_ref)
+            pre_quant_scale = (torch.rand(in_f) * 0.5 + 0.75).to(torch.bfloat16)
+            parent = name.rsplit(".", 1)[0]
+            for i, leaf in enumerate(("to_q", "to_k", "to_v")):
+                _emit_svdquant_entries(
+                    weights,
+                    f"{parent}.{leaf}",
+                    qweight[i * shard_out : (i + 1) * shard_out],
+                    weight_scale[i * shard_out : (i + 1) * shard_out],
+                    weight_scale_2,
+                    pre_quant_scale,
+                    rank,
+                    shard_out,
+                    in_f,
+                )
+            continue
+        # Every other projection gets its own scales (negative case for the
+        # attn2 shared-quantize eligibility check).
         w_ref = (torch.randn(out_f, in_f, device="cuda") * 0.02).to(torch.bfloat16)
         qweight, weight_scale, weight_scale_2 = quantize_nvfp4(w_ref)
-        ck = _ckpt_name(name)
-        parent, _, leaf = name.rpartition(".")
-        if parent.endswith(".attn1") and leaf in ("to_q", "to_k", "to_v"):
-            if parent not in shared_pqs:
-                shared_pqs[parent] = (torch.rand(in_f) * 0.5 + 0.75).to(torch.bfloat16)
-            pre_quant_scale = shared_pqs[parent]
-        else:
-            pre_quant_scale = (torch.rand(in_f) * 0.5 + 0.75).to(torch.bfloat16)
-        weights[f"{ck}.weight"] = qweight.cpu()
-        weights[f"{ck}.weight_scale"] = weight_scale.cpu()
-        weights[f"{ck}.weight_scale_2"] = weight_scale_2.cpu()
-        weights[f"{ck}.input_scale"] = torch.tensor(0.005, dtype=torch.float32)
-        weights[f"{ck}.pre_quant_scale"] = pre_quant_scale
-        weights[f"{ck}.svdquant_lora_a"] = (torch.randn(rank, in_f) * 0.01).to(torch.bfloat16)
-        weights[f"{ck}.svdquant_lora_b"] = (torch.randn(out_f, rank) * 0.01).to(torch.bfloat16)
-        weights[f"{ck}.bias"] = torch.zeros(out_f, dtype=torch.bfloat16)
-        covered.update(f"{name}.{param_name}" for param_name, _ in module.named_parameters())
+        pre_quant_scale = (torch.rand(in_f) * 0.5 + 0.75).to(torch.bfloat16)
+        _emit_svdquant_entries(
+            weights, ck, qweight, weight_scale, weight_scale_2, pre_quant_scale, rank, out_f, in_f
+        )
     for name, param in model.named_parameters():
         if name in covered:
             continue
         ck = _ckpt_name(name)
+        if name.endswith(".attn1.qkv_proj.weight") or name.endswith(".attn1.qkv_proj.bias"):
+            # NVFP4-excluded blocks keep the fused QKV Linear unquantized; the
+            # checkpoint still stores per-projection tensors.
+            parent = name.rsplit(".", 2)[0]
+            leaf_param = name.rsplit(".", 1)[1]
+            shard_out = param.shape[0] // 3
+            full = (
+                torch.zeros(param.shape, dtype=torch.bfloat16)
+                if leaf_param == "bias"
+                else (torch.randn(param.shape) * 0.02).to(torch.bfloat16)
+            )
+            for i, leaf in enumerate(("to_q", "to_k", "to_v")):
+                weights[f"{parent}.{leaf}.{leaf_param}"] = full[i * shard_out : (i + 1) * shard_out]
+            continue
         if "norm" in name and name.endswith(".weight"):
             weights[ck] = torch.ones(param.shape, dtype=torch.bfloat16)
         elif name.endswith(".bias"):
@@ -179,11 +230,11 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
 
 
 @skip_sm100
-def test_svdquant_checkpoint_builds_separate_qkv():
+def test_svdquant_checkpoint_keeps_fused_qkv():
     model = _make_model("NVFP4_SVD")
     attn1 = model.blocks[0].attn1
-    assert attn1.qkv_mode == QKVMode.SEPARATE_QKV
-    assert hasattr(attn1, "to_q") and not hasattr(attn1, "qkv_proj")
+    assert attn1.qkv_mode == QKVMode.FUSE_QKV
+    assert hasattr(attn1, "qkv_proj") and not hasattr(attn1, "to_q")
 
 
 @skip_sm100
@@ -200,40 +251,52 @@ def test_load_weights_swaps_method_and_activates_fused_kernel():
     model.load_weights(_build_svdquant_state_dict(model, rank=_RANK))
     model.post_load_weights()
 
-    quantized = model.blocks[1].attn1.to_q
-    assert isinstance(quantized.quant_method, NVFP4SVDLinearMethod)
-    assert quantized.svdquant_lora_a is not None
-    assert quantized.svdquant_lora_a.shape[0] == _RANK
-    assert quantized._svdquant_use_fused
+    # Fused QKV: the per-projection factors concatenate into one rank-3r
+    # correction — L2 stacked along the rank dim, L1 block-diagonal.
+    qkv = model.blocks[1].attn1.qkv_proj
+    assert isinstance(qkv.quant_method, NVFP4SVDLinearMethod)
+    assert qkv.svdquant_lora_a.shape == (3 * _RANK, _HIDDEN)
+    assert qkv.svdquant_lora_b.shape == (3 * _HIDDEN, 3 * _RANK)
+    lora_b = qkv.svdquant_lora_b.float()
+    assert torch.equal(lora_b[:_HIDDEN, _RANK:], torch.zeros_like(lora_b[:_HIDDEN, _RANK:]))
+    assert torch.equal(
+        lora_b[_HIDDEN : 2 * _HIDDEN, :_RANK],
+        torch.zeros_like(lora_b[_HIDDEN : 2 * _HIDDEN, :_RANK]),
+    )
+    assert qkv._svdquant_use_fused
+
+    cross_q = model.blocks[1].attn2.to_q
+    assert isinstance(cross_q.quant_method, NVFP4SVDLinearMethod)
+    assert cross_q.svdquant_lora_a.shape[0] == _RANK
+    assert cross_q._svdquant_use_fused
 
     ffn_up = model.blocks[1].ffn.up_proj
     assert isinstance(ffn_up.quant_method, NVFP4SVDLinearMethod)
     assert ffn_up._svdquant_use_fused
 
-    # Self-attn q/k/v share bit-identical scales -> one shared smoothed
-    # quantize; cross-attn to_q has its own scales -> no sharing.
-    assert model.blocks[1].attn1._svdquant_share_qkv_quantize
+    # Cross-attn projections keep their own scales -> no shared quantize
+    # (self-attn quantizes once inside the fused QKV projection).
+    assert not model.blocks[1].attn1._svdquant_share_qkv_quantize
     assert not model.blocks[1].attn2._svdquant_share_qkv_quantize
 
     # blocks.0* is in the quantization ignore list: stays unquantized/unswapped.
-    excluded = model.blocks[0].attn1.to_q
+    excluded = model.blocks[0].attn1.qkv_proj
     assert not isinstance(excluded.quant_method, NVFP4SVDLinearMethod)
     assert excluded.weight.dtype == torch.bfloat16
 
 
 @skip_sm100
-def test_rank64_loads_and_falls_back_to_reference_path():
+@pytest.mark.parametrize("rank", [64, 128])
+def test_wide_ranks_run_fused(rank):
+    """Ranks 64/128 fuse too (per-projection rank r, fused QKV rank 3r)."""
     model = _make_model("NVFP4_SVD")
-    model.load_weights(_build_svdquant_state_dict(model, rank=64))
+    model.load_weights(_build_svdquant_state_dict(model, rank=rank))
     model.post_load_weights()
 
-    quantized = model.blocks[1].attn1.to_q
-    assert isinstance(quantized.quant_method, NVFP4SVDLinearMethod)
-    assert quantized.svdquant_lora_a.shape[0] == 64
-    assert not quantized._svdquant_use_fused
-    # Sharing requires the fused path; the reference fallback keeps
-    # per-projection quantization.
-    assert not model.blocks[1].attn1._svdquant_share_qkv_quantize
+    qkv = model.blocks[1].attn1.qkv_proj
+    assert qkv.svdquant_lora_a.shape[0] == 3 * rank
+    assert qkv._svdquant_use_fused
+    assert model.blocks[1].attn2.to_q._svdquant_use_fused
 
     x, encoder, temb, freqs_cos, freqs_sin = _block_inputs()
     with torch.inference_mode():
@@ -242,9 +305,12 @@ def test_rank64_loads_and_falls_back_to_reference_path():
 
 
 @skip_sm100
-def test_block_forward_fused_matches_reference():
+@pytest.mark.parametrize("rank", [32, 64, 128])
+def test_block_forward_fused_matches_reference(rank):
+    """Fused kernels == unfused reference on the same loaded block, covering
+    fused-QKV LoRA ranks 96/192/384 (= 3 x the per-projection rank)."""
     model = _make_model("NVFP4_SVD")
-    model.load_weights(_build_svdquant_state_dict(model, rank=_RANK))
+    model.load_weights(_build_svdquant_state_dict(model, rank=rank))
     model.post_load_weights()
     block = model.blocks[1]
 
@@ -262,9 +328,6 @@ def test_block_forward_fused_matches_reference():
     assert svd_linears, "expected fused SVDQuant Linears in the quantized block"
     for module in svd_linears:
         module._svdquant_use_fused = False
-    # Keep flags consistent with the reference path (finalize ties sharing to
-    # the fused path in production).
-    block.attn1._svdquant_share_qkv_quantize = False
     with torch.inference_mode():
         out_reference = block(x, encoder, temb, freqs_cos, freqs_sin)
 

@@ -30,16 +30,6 @@ except ImportError:
         return next(module.parameters()).device
 
 
-def _is_svdquant_quantization_config(pretrained_config) -> bool:
-    """True when the checkpoint's embedded quantization_config is ModelOpt
-    SVDQuant (``NVFP4_SVD``: NVFP4 residual + rank-r BF16 LoRA correction)."""
-    quantization_config = getattr(pretrained_config, "quantization_config", None)
-    return (
-        isinstance(quantization_config, dict)
-        and quantization_config.get("quant_algo") == "NVFP4_SVD"
-    )
-
-
 # =========================================================================
 # 1. Rotary Positional Embeddings
 # =========================================================================
@@ -310,16 +300,14 @@ class WanBlock(nn.Module):
         ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
         _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
         self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
-        # SVDQuant checkpoints carry per-projection rank-r LoRA factors and
-        # per-projection NVFP4 global scales. Concatenating q/k/v would stack
-        # the LoRA factors block-diagonally (3x the rank, past the fused
-        # kernel's fixed rank-32) and force a lossy requantization onto shared
-        # scales, so keep the projections separate: each runs the fused rank-r
-        # SVDQuant GEMM with its exact checkpoint factors.
-        _svdquant = _is_svdquant_quantization_config(config)
-        _qkv_mode_self = (
-            QKVMode.SEPARATE_QKV if (self._use_async_ulysses or _svdquant) else QKVMode.FUSE_QKV
-        )
+        # SVDQuant checkpoints use the same fused QKV projection as plain
+        # NVFP4: a self-attention's q/k/v carry bit-identical pre_quant_scale
+        # / input_scale / weight_scale_2 (ModelOpt's calibration invariant,
+        # asserted at load), so the NVFP4 residuals concatenate losslessly and
+        # the per-projection rank-r LoRA factors stack block-diagonally into
+        # one rank-3r correction (the fused kernel accepts any rank that is a
+        # positive multiple of 32).
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
